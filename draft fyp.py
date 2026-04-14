@@ -3,13 +3,12 @@ import re
 import time
 import random
 import hashlib
+import argparse
 
 import pandas as pd
 import numpy as np
 # This makes graphs show properly in Pycharm.
 import matplotlib
-
-matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 # Machine Learning tools
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
@@ -24,7 +23,8 @@ from sklearn.metrics import (
     brier_score_loss,
     roc_curve,
     precision_recall_curve,
-    average_precision_score
+    average_precision_score,
+    classification_report
 )
 from scipy.sparse import hstack, csr_matrix
 from scipy.stats import ttest_rel
@@ -36,22 +36,24 @@ RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
 random.seed(RANDOM_STATE)
 # This shows the dataset path i have used
-CSV_PATH = r"D:\fyp\enron_data_fraud_labeled.csv"
+DEFAULT_CSV_PATH = r"D:\fyp\enron_data_fraud_labeled.csv"
 # Fast mode uses a smaller sample for quicker testing
 # Quick run settings
-FAST_MODE = True
+FAST_MODE = False
 FAST_SAMPLE_SIZE = 2500
 SAMPLE_SIZE = 8000
 # Maximum number of text features used by TF-IDF
 TFIDF_MAX_FEATURES = 800
 # Number of cross-validation folds
-CV_SPLITS = 2
+CV_SPLITS = 5
 # Show plots at the end
 SHOW_PLOTS = True
 # Thresholds used for testing different alert levels
-THRESHOLDS = [0.5, 0.6, 0.7]
+THRESHOLDS = [0.1, 0.2, 0.3, 0.5, 0.6, 0.7]
 # Folder for saved graphs
 PLOT_DIR = "plots"
+# Folder for saved outputs
+RESULTS_DIR = "results"
 
 
 # KEYWORD LISTS
@@ -104,7 +106,7 @@ def uppercase_ratio(text):
     uppers = sum(ch.isupper() for ch in text)
     return uppers / letters if letters > 0 else 0.0
 
-# This will count how many suspicous words appear in the email
+# This will count how many suspicious words appear in the email
 def keyword_count(text, keywords):
     text = str(text).lower()
     total = 0
@@ -120,7 +122,6 @@ def hash_value(value, salt="fyp_project"):
 
 # Replaces sensitive information with tokens
 # This keeps patterns but hides private details
-
 def redact_sensitive_text(text):
     text = str(text)
     text = re.sub(r'\b[\w\.-]+@[\w\.-]+\.\w+\b', ' EMAIL_TOKEN ', text)
@@ -156,13 +157,58 @@ def show_dataset_info(df, csv_path):
 
     print("=" * 70)
 
+# This creates folders if they do not already exist
+def ensure_dirs():
+    os.makedirs(PLOT_DIR, exist_ok=True)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# This tries to find the dataset path automatically
+def resolve_csv_path(csv_path):
+    possible_paths = [
+        csv_path,
+        DEFAULT_CSV_PATH,
+        os.path.join(os.getcwd(), "enron_data_fraud_labeled.csv"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "enron_data_fraud_labeled.csv"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "enron_data_fraud_labeled.csv"),
+    ]
+
+    for path in possible_paths:
+        if path and os.path.exists(path):
+            return path
+
+    raise FileNotFoundError(
+        "Dataset not found. Tried these locations:\n" +
+        "\n".join(possible_paths)
+    )
+
+# This saves key metrics to a csv file
+def save_results_table(results_rows):
+    results_df = pd.DataFrame(results_rows)
+    output_path = os.path.join(RESULTS_DIR, "model_results_summary.csv")
+    results_df.to_csv(output_path, index=False)
+    print(f"\nResults summary saved to: {output_path}")
+
+# This saves threshold results to a csv file
+def save_threshold_table(threshold_rows):
+    threshold_df = pd.DataFrame(threshold_rows)
+    output_path = os.path.join(RESULTS_DIR, "threshold_results_summary.csv")
+    threshold_df.to_csv(output_path, index=False)
+    print(f"Threshold summary saved to: {output_path}")
+
+# This measures inference time more fairly by averaging many runs
+def measure_average_inference_time(model, X_test, repeats=100):
+    start = time.perf_counter()
+    for _ in range(repeats):
+        _ = model.predict_proba(X_test)[:, 1]
+    total = time.perf_counter() - start
+    return total / repeats
+
 
 # DATA LOADING
 # This loads the dataset which checks the required columns
 # Removes incomplete rows and samples of data if needed
 def load_dataset(csv_path):
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"Dataset not found: {csv_path}")
+    csv_path = resolve_csv_path(csv_path)
 
     df = pd.read_csv(csv_path, low_memory=False)
 
@@ -229,7 +275,7 @@ def build_common_features(df):
 # This creates and saves the ROC curve and Precision Recall curve
 def plot_metrics(y_test, probs, model_name):
     os.makedirs(PLOT_DIR, exist_ok=True)
-    safe_name = model_name.lower().replace(" ", "_")
+    safe_name = model_name.lower().replace(" ", "_").replace("-", "_")
 # ROC curve
     fpr, tpr, _ = roc_curve(y_test, probs)
     auc_score = roc_auc_score(y_test, probs)
@@ -268,7 +314,7 @@ def plot_metrics(y_test, probs, model_name):
 # RUN ONE MODEL
 # Runs one full experiment
 # Prepare data
-# Spilt data
+# Split data
 # Convert text to numbers
 # Combine text and numeric features
 # Train the model
@@ -281,12 +327,12 @@ def run_experiment(common_df, use_privacy):
     print("=" * 70)
 
     df = common_df.copy()
-# In privacy mode, hide senstive parts of the text first
+# In privacy mode, hide sensitive parts of the text first
     if use_privacy:
         df["Model_Text"] = df["Body"].apply(redact_sensitive_text)
     else:
         df["Model_Text"] = df["Body"]
-# Spilt into training and testing sets
+# Split into training and testing sets
     train_df, test_df = train_test_split(
         df,
         test_size=0.2,
@@ -328,12 +374,12 @@ def run_experiment(common_df, use_privacy):
     scaler = StandardScaler()
     X_train_num = scaler.fit_transform(train_df[numeric_cols])
     X_test_num = scaler.transform(test_df[numeric_cols])
-# Combine test and numeric features
+# Combine text and numeric features
     X_train = hstack([X_train_text, csr_matrix(X_train_num)])
     X_test = hstack([X_test_text, csr_matrix(X_test_num)])
 # Lightweight classifier
     model = LogisticRegression(
-        max_iter=200,
+        max_iter=500,
         class_weight="balanced",
         solver="liblinear",
         random_state=RANDOM_STATE
@@ -341,7 +387,7 @@ def run_experiment(common_df, use_privacy):
 # Cross validation check model stability
     cv = StratifiedKFold(n_splits=CV_SPLITS, shuffle=True, random_state=RANDOM_STATE)
 
-    start_cv = time.time()
+    start_cv = time.perf_counter()
     cv_scores = cross_val_score(
         model,
         X_train,
@@ -350,18 +396,17 @@ def run_experiment(common_df, use_privacy):
         scoring="roc_auc",
         n_jobs=-1
     )
-    cv_time = time.time() - start_cv
+    cv_time = time.perf_counter() - start_cv
 
     print(f"Mean CV ROC-AUC: {np.mean(cv_scores):.6f}")
     print(f"Cross-validation Time: {cv_time:.6f} seconds")
 # Trains the final model
-    start_train = time.time()
+    start_train = time.perf_counter()
     model.fit(X_train, y_train)
-    train_time = time.time() - start_train
+    train_time = time.perf_counter() - start_train
 # Predict the probability of each email being suspicious
-    start_infer = time.time()
     probs = model.predict_proba(X_test)[:, 1]
-    infer_time = time.time() - start_infer
+    infer_time = measure_average_inference_time(model, X_test, repeats=100)
 # Main evaluation metrics
     roc_auc = roc_auc_score(y_test, probs)
     avg_precision = average_precision_score(y_test, probs)
@@ -371,11 +416,14 @@ def run_experiment(common_df, use_privacy):
     print(f"Average Precision: {avg_precision:.6f}")
     print(f"Brier Score: {brier:.6f}")
     print(f"Training Time: {train_time:.6f} seconds")
-    print(f"Inference Time: {infer_time:.6f} seconds")
+    print(f"Average Inference Time: {infer_time:.6f} seconds")
 # Create and save graphs
     figures = plot_metrics(y_test, probs, model_label)
 # Test different thresholds for alert decisions
     print("\nThreshold-based intrusion alert analysis")
+
+    threshold_rows = []
+
     for thr in THRESHOLDS:
         preds = (probs >= thr).astype(int)
 
@@ -395,8 +443,34 @@ def run_experiment(common_df, use_privacy):
         print(f"F1: {f1:.4f}")
         print("Confusion Matrix:")
         print(cm)
+        print("Classification Report:")
+        print(classification_report(y_test, preds, zero_division=0))
 
-    return cv_scores, figures
+        threshold_rows.append({
+            "Model": model_label,
+            "Threshold": thr,
+            "Accuracy": acc,
+            "Precision": prec,
+            "Recall": rec,
+            "F1": f1,
+            "TN": cm[0, 0],
+            "FP": cm[0, 1],
+            "FN": cm[1, 0],
+            "TP": cm[1, 1]
+        })
+
+    results_row = {
+        "Model": model_label,
+        "Mean_CV_ROC_AUC": float(np.mean(cv_scores)),
+        "Test_ROC_AUC": float(roc_auc),
+        "Average_Precision": float(avg_precision),
+        "Brier_Score": float(brier),
+        "Training_Time_Seconds": float(train_time),
+        "Average_Inference_Time_Seconds": float(infer_time),
+        "CV_Time_Seconds": float(cv_time)
+    }
+
+    return cv_scores, figures, results_row, threshold_rows
 
 
 
@@ -407,20 +481,41 @@ def run_experiment(common_df, use_privacy):
 # Run baseline model
 # Run privacy-aware mode
 # Compare both models with a t test
+def parse_args():
+    parser = argparse.ArgumentParser(description="Privacy-aware email IDS experiment")
+    parser.add_argument(
+        "--csv_path",
+        type=str,
+        default=DEFAULT_CSV_PATH,
+        help="Path to the dataset csv file"
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     all_figures = []
+    all_results_rows = []
+    all_threshold_rows = []
+
+    ensure_dirs()
 # Load dataset
-    base_df = load_dataset(CSV_PATH)
+    base_df = load_dataset(args.csv_path)
 # Show dataset details
-    show_dataset_info(base_df, CSV_PATH)
+    resolved_path = resolve_csv_path(args.csv_path)
+    show_dataset_info(base_df, resolved_path)
 # Build common features once
     common_df = build_common_features(base_df)
 # Run baseline model
-    cv_non_priv, figs_non_priv = run_experiment(common_df, use_privacy=False)
+    cv_non_priv, figs_non_priv, row_non_priv, thr_non_priv = run_experiment(common_df, use_privacy=False)
     all_figures.extend(figs_non_priv)
+    all_results_rows.append(row_non_priv)
+    all_threshold_rows.extend(thr_non_priv)
 # Run privacy aware model
-    cv_priv, figs_priv = run_experiment(common_df, use_privacy=True)
+    cv_priv, figs_priv, row_priv, thr_priv = run_experiment(common_df, use_privacy=True)
     all_figures.extend(figs_priv)
+    all_results_rows.append(row_priv)
+    all_threshold_rows.extend(thr_priv)
 # Compare both models statistically
     print("\n" + "=" * 70)
     print("STATISTICAL TEST (paired t-test)")
@@ -435,6 +530,11 @@ if __name__ == "__main__":
         print("Significant difference detected.")
     else:
         print("No significant difference.")
+
+# Save outputs for evidence
+    save_results_table(all_results_rows)
+    save_threshold_table(all_threshold_rows)
+
 # Shows the graphs at the end
     if SHOW_PLOTS:
         plt.show()
